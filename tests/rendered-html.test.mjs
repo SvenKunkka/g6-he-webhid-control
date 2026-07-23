@@ -22,7 +22,7 @@ test("server-renders the G6 HE control lab", async () => {
   const html = await response.text();
   assert.match(html, /<title>G6 HE Control Lab<\/title>/i);
   assert.match(html, /连接 G6 HE/);
-  assert.match(html, /DPI 曲线/);
+  assert.match(html, /DPI 预设/);
   assert.match(html, /回报率/);
   assert.match(html, /20K FPS/);
   assert.match(html, /按键映射/);
@@ -37,11 +37,16 @@ test("keeps HID writes target-scoped and guarded", async () => {
   );
 
   assert.match(source, /const VID = 0x3434/);
-  assert.match(source, /const PID = 0xd086/);
+  assert.match(source, /const LEGACY_PID = 0xd086/);
+  assert.match(source, /const DIY_PID = 0xd687/);
+  assert.match(source, /usagePage === 0xff00/);
   assert.match(source, /usagePage === 0xffc1/);
   assert.match(source, /需要唯一一只 G6 HE/);
-  assert.match(source, /fps20kSupport=false/);
-  assert.match(source, /已阻止越界写入/);
+  assert.match(source, /G6H1/);
+  assert.match(source, /crc32/);
+  assert.match(source, /0xedb88320/);
+  assert.match(source, /USB 正在按新端点周期重新枚举/);
+  assert.match(source, /await wait\(1000\)/);
   assert.match(source, /sendFeatureReport/);
   assert.doesNotMatch(source, /sendReport\(/);
 });

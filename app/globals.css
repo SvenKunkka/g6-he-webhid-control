@@ -472,6 +472,21 @@ button:disabled {
   background: #697174;
 }
 
+.toggle.on {
+  border-color: rgba(216, 255, 79, .7);
+  background: rgba(216, 255, 79, .07);
+}
+
+.toggle.on i {
+  border-color: var(--acid);
+  background: rgba(216, 255, 79, .2);
+}
+
+.toggle.on i::after {
+  margin-left: 20px;
+  background: var(--acid);
+}
+
 .select-line {
   display: flex;
   align-items: center;
