@@ -7,6 +7,10 @@ const LEGACY_PID = 0xd086;
 const DIY_PID = 0xd687;
 const REPORT_ID = 0x51;
 const FRAME_SIZE = 63;
+const ORIGINAL_LONG_OUT = 0xb3;
+const ORIGINAL_LONG_IN = 0xb4;
+const ORIGINAL_SHORT_OUT = 0xb5;
+const ORIGINAL_SHORT_IN = 0xb6;
 const POLLING = [125, 500, 1000, 2000, 4000, 8000];
 const DEFAULT_DPI = [400, 800, 1600, 3200, 5000];
 const BUTTONS = [
@@ -52,6 +56,10 @@ type ProtocolMode = "none" | "legacy" | "diy";
 type LogItem = { at: string; level: "ok" | "warn" | "error" | "info"; text: string };
 type Mapping = Record<number, string>;
 type HidCollection = { usagePage?: number; usage?: number };
+type HidInputReportEventLike = {
+  reportId: number;
+  data: DataView;
+};
 type HidDeviceLike = {
   opened: boolean;
   productName: string;
@@ -60,6 +68,9 @@ type HidDeviceLike = {
   collections?: HidCollection[];
   open(): Promise<void>;
   close(): Promise<void>;
+  addEventListener(type: "inputreport", listener: (event: HidInputReportEventLike) => void): void;
+  removeEventListener(type: "inputreport", listener: (event: HidInputReportEventLike) => void): void;
+  sendReport(reportId: number, data: BufferSource): Promise<void>;
   sendFeatureReport(reportId: number, data: BufferSource): Promise<void>;
   receiveFeatureReport(reportId: number): Promise<DataView>;
 };
@@ -158,6 +169,10 @@ function decodeLegacy(bytes: Uint8Array) {
   return found?.[0] ?? `未知 ${hex(value, 6)}`;
 }
 
+function ascii(bytes: Uint8Array) {
+  return new TextDecoder().decode(bytes).replace(/\0+$/, "");
+}
+
 export function G6Console() {
   const [state, setState] = useState<DeviceState>("idle");
   const [mode, setMode] = useState<ProtocolMode>("none");
@@ -180,6 +195,8 @@ export function G6Console() {
   const deviceRef = useRef<HidDeviceLike | null>(null);
   const sequenceRef = useRef(0);
   const diyMapRef = useRef([1, 2, 3, 4, 5, 6, 7, 0]);
+  const originalWorkModeRef = useRef(0);
+  const originalPollingLevelsRef = useRef([2, 2]);
 
   const addLog = useCallback((text: string, level: LogItem["level"] = "info") => {
     setLogs((items) => [{ at: now(), level, text }, ...items].slice(0, 18));
@@ -199,12 +216,44 @@ export function G6Console() {
   }, [rawTransaction]);
 
   const legacyTransaction = useCallback(async (reportId: number, payload: Uint8Array, expected: number) => {
-    const response = await rawTransaction(reportId, payload);
-    if (!response.length || response[0] !== expected) {
-      throw new Error(`原厂响应异常：期望 ${hex(expected, 2)}`);
+    const device = deviceRef.current;
+    if (!device?.opened) throw new Error("设备未连接");
+    const inputReport = reportId === ORIGINAL_LONG_OUT ? ORIGINAL_LONG_IN : ORIGINAL_SHORT_IN;
+    const response = await new Promise<Uint8Array>((resolve, reject) => {
+      let timer = 0;
+      const onReport = (event: HidInputReportEventLike) => {
+        const bytes = new Uint8Array(
+          event.data.buffer,
+          event.data.byteOffset,
+          event.data.byteLength,
+        );
+        const matchesDirect = event.reportId === inputReport &&
+          bytes[0] === expected;
+        const matchesAck = event.reportId === ORIGINAL_SHORT_IN &&
+          bytes[0] === 0xe4 &&
+          bytes[2] === expected;
+        const matches = matchesDirect || matchesAck;
+        if (!matches) return;
+        window.clearTimeout(timer);
+        device.removeEventListener("inputreport", onReport);
+        resolve(bytes);
+      };
+      timer = window.setTimeout(() => {
+        device.removeEventListener("inputreport", onReport);
+        reject(new Error(`原厂命令 ${hex(expected, 2)} 等待响应超时`));
+      }, 1500);
+      device.addEventListener("inputreport", onReport);
+      device.sendReport(reportId, payload).catch((error) => {
+        window.clearTimeout(timer);
+        device.removeEventListener("inputreport", onReport);
+        reject(error);
+      });
+    });
+    if (response[0] === 0xe4 && response[1] !== 0) {
+      addLog(`原厂 ACK：E4 ${hex(response[1], 2)} ${hex(response[2], 2)}；将立即只读回查。`, "warn");
     }
     return response;
-  }, [rawTransaction]);
+  }, [addLog]);
 
   const readDiy = useCallback(async () => {
     const capabilities = await diyTransaction(0x01);
@@ -242,29 +291,50 @@ export function G6Console() {
   }, [activeDpi, addLog, diyTransaction, dpi]);
 
   const readLegacy = useCallback(async () => {
-    const baseRequest = new Uint8Array(20);
-    baseRequest[0] = 7;
-    const base = await legacyTransaction(0x51, baseRequest, 7);
-    const currentDpi = base[2] & 0x0f;
-    const currentPolling = (base[2] >> 4) & 0x0f;
-    const values = Array.from({ length: 5 }, (_, i) => get16(base, 5 + i * 2));
-    const cleanValues = values.every((value) => value > 0) ? values : DEFAULT_DPI;
+    const deviceRequest = new Uint8Array(20);
+    deviceRequest[0] = 2;
+    const device = await legacyTransaction(ORIGINAL_SHORT_OUT, deviceRequest, 2);
+    const workMode = device[9] & 0x07;
 
+    const versionRequest = new Uint8Array(63);
+    versionRequest[0] = 4;
+    const version = await legacyTransaction(ORIGINAL_LONG_OUT, versionRequest, 4);
+
+    const baseRequest = new Uint8Array(63);
+    baseRequest[0] = 6;
+    const base = await legacyTransaction(ORIGINAL_LONG_OUT, baseRequest, 6);
+
+    const dpiRequest = new Uint8Array(63);
+    dpiRequest[0] = 0x49;
+    const dpiXY = await legacyTransaction(ORIGINAL_LONG_OUT, dpiRequest, 0x49);
+
+    const pollingRequest = new Uint8Array(20);
+    pollingRequest[0] = 0x4b;
+    const pollingSeparate = await legacyTransaction(
+      ORIGINAL_SHORT_OUT,
+      pollingRequest,
+      0x4b,
+    );
+    const modeOffset = Math.min(workMode, 1);
+    const currentDpi = dpiXY[1 + Math.min(workMode, 2)] & 0x0f;
+    const pollingLevels = [pollingSeparate[1], pollingSeparate[2]];
+    const currentPolling = pollingLevels[modeOffset];
+    const values = Array.from({ length: 5 }, (_, i) => get16(dpiXY, 5 + i * 2));
+    originalWorkModeRef.current = workMode;
+    originalPollingLevelsRef.current = pollingLevels;
     setActiveDpi(Math.min(currentDpi, 4));
-    setDpi(cleanValues);
-    setPolling([125, 500, 1000][currentPolling] ?? 1000);
-
-    const infoRequest = new Uint8Array(20);
-    infoRequest[0] = 6;
-    const info = await legacyTransaction(0x51, infoRequest, 6);
-    const version = `${info[8]}.${(info[7] >> 4) & 0x0f}.${info[7] & 0x0f}`;
-    setFirmware(version);
-    setBattery(info[10]);
-    setProtocol("原厂 1K Feature / 0x51");
-    setFps20k(false);
+    setDpi(values);
+    setPolling(POLLING[currentPolling] ?? 1000);
+    setFirmware(ascii(version.slice(2, 2 + version[1])));
+    setBattery(null);
+    setProtocol("原厂 8K · B3/B4 + B5/B6");
+    setFps20k(Boolean(base[52] & 1));
     setHealth(null);
     setMode("legacy");
-    addLog(`原厂握手成功：FW ${version}。2K–8K 与 20K 写入保持锁定。`, "warn");
+    addLog(
+      `原厂 v6 握手成功：FW ${ascii(version.slice(2, 2 + version[1]))}，模式 ${workMode}，${POLLING[currentPolling] ?? "?"} Hz。`,
+      "ok",
+    );
   }, [addLog, legacyTransaction]);
 
   const readMappings = useCallback(async () => {
@@ -279,10 +349,10 @@ export function G6Console() {
     if (mode !== "legacy") throw new Error("设备协议尚未识别");
     const next: Mapping = {};
     for (const button of BUTTONS) {
-      const request = new Uint8Array(64);
+      const request = new Uint8Array(63);
       request[0] = 98;
       request[1] = button.legacyIndex;
-      const response = await legacyTransaction(0x52, request, 98);
+      const response = await legacyTransaction(ORIGINAL_LONG_OUT, request, 98);
       next[button.diyIndex] = response[3] === 1
         ? decodeLegacy(response.slice(4, 7))
         : response[3] === 9 ? "禁用" : `功能类型 ${response[3]}`;
@@ -358,6 +428,26 @@ export function G6Console() {
     }
   }, [addLog, readCurrentDevice]);
 
+  const recoverConfiguration = useCallback(async () => {
+    setBusy(true);
+    try {
+      if (mode === "legacy") {
+        const payload = new Uint8Array(20);
+        payload.set([0x0f, 0xff]);
+        await legacyTransaction(ORIGINAL_SHORT_OUT, payload, 0x0f);
+        await wait(300);
+        await readLegacy();
+        addLog("原厂全部配置已恢复；DPI / 回报率 / HE 参数回到默认值。", "ok");
+      } else {
+        await reconnect();
+      }
+    } catch (error) {
+      addLog(`配置恢复失败：${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      setBusy(false);
+    }
+  }, [addLog, legacyTransaction, mode, readLegacy, reconnect]);
+
   const applyDpi = useCallback(async () => {
     setBusy(true);
     try {
@@ -366,11 +456,14 @@ export function G6Console() {
         await diyTransaction(0x10, [value & 0xff, value >> 8]);
       } else if (mode === "legacy") {
         if (dpi.some((item) => item > 30000)) throw new Error("原厂协议上限为 30000 DPI");
-        const payload = new Uint8Array(20);
-        payload.set([64, activeDpi, activeDpi, activeDpi]);
-        dpi.forEach((item, i) => put16(payload, 4 + i * 2, item));
-        payload[14] = 5;
-        await legacyTransaction(0x51, payload, 64);
+        const payload = new Uint8Array(63);
+        payload.set([0x48, activeDpi, activeDpi, activeDpi, 5]);
+        dpi.forEach((item, i) => {
+          put16(payload, 5 + i * 2, item);
+          put16(payload, 21 + i * 2, item);
+        });
+        payload[37] = 0;
+        await legacyTransaction(ORIGINAL_LONG_OUT, payload, 0x48);
       } else {
         throw new Error("设备协议尚未识别");
       }
@@ -403,11 +496,18 @@ export function G6Console() {
         deviceRef.current = device;
         await readDiy();
       } else if (mode === "legacy") {
-        const level = [125, 500, 1000].indexOf(polling);
-        if (level < 0) throw new Error("原厂固件仅开放 125 / 500 / 1000 Hz");
+        const level = POLLING.indexOf(polling);
+        if (level < 0) throw new Error("原厂固件仅开放 125 / 500 / 1000 / 2000 / 4000 / 8000 Hz");
         const payload = new Uint8Array(20);
-        payload.set([65, level, level, 0, 1, 2]);
-        await legacyTransaction(0x51, payload, 65);
+        const levels = [...originalPollingLevelsRef.current];
+        levels[Math.min(originalWorkModeRef.current, 1)] = level;
+        payload.set([0x4a, levels[0], levels[1], POLLING.length, POLLING.length]);
+        POLLING.forEach((_, tableIndex) => {
+          payload[5 + tableIndex] = tableIndex;
+          payload[11 + tableIndex] = tableIndex;
+        });
+        await legacyTransaction(ORIGINAL_SHORT_OUT, payload, 0x4a);
+        originalPollingLevelsRef.current = levels;
       } else {
         throw new Error("设备协议尚未识别");
       }
@@ -425,17 +525,32 @@ export function G6Console() {
   const applyFps20k = useCallback(async () => {
     setBusy(true);
     try {
-      if (mode !== "diy") throw new Error("20K 仅由 DIY 固件的已验证 0x6E profile 开放");
-      await diyTransaction(0x12, [0x20, 0x4e]);
-      setFps20k(true);
-      addLog("传感器已保持 20K 高性能 profile。", "ok");
+      if (mode === "diy") {
+        await diyTransaction(0x12, [0x20, 0x4e]);
+        setFps20k(true);
+        addLog("传感器已保持 20K 高性能 profile。", "ok");
+      } else if (mode === "legacy") {
+        const payload = new Uint8Array(20);
+        payload[0] = 66;
+        payload[1] = 1;
+        payload[2] = 2;
+        payload[3] = 2;
+        payload[4] = 2;
+        payload[6] = 1;
+        payload[8] = 2;
+        await legacyTransaction(ORIGINAL_SHORT_OUT, payload, 66);
+        setFps20k(true);
+        addLog("已按原厂 8K 协议请求开启 20K FPS，并执行只读回查。", "ok");
+      } else {
+        throw new Error("设备协议尚未识别");
+      }
       await readCurrentDevice();
     } catch (error) {
       addLog(`20K 设置失败：${error instanceof Error ? error.message : String(error)}`, "error");
     } finally {
       setBusy(false);
     }
-  }, [addLog, diyTransaction, mode, readCurrentDevice]);
+  }, [addLog, diyTransaction, legacyTransaction, mode, readCurrentDevice]);
 
   const applyMapping = useCallback(async (diyIndex: number, value: string) => {
     setBusy(true);
@@ -448,7 +563,7 @@ export function G6Console() {
       } else if (mode === "legacy") {
         const button = BUTTONS.find((item) => item.diyIndex === diyIndex);
         if (!button) throw new Error("按键索引不存在");
-        const payload = new Uint8Array(64);
+        const payload = new Uint8Array(63);
         payload[0] = 82;
         payload[1] = button.legacyIndex;
         payload[3] = value === "禁用" ? 9 : 1;
@@ -458,7 +573,7 @@ export function G6Console() {
           payload[5] = (code >> 8) & 0xff;
           payload[6] = code & 0xff;
         }
-        await legacyTransaction(0x52, payload, 82);
+        await legacyTransaction(ORIGINAL_LONG_OUT, payload, 82);
       } else {
         throw new Error("设备协议尚未识别");
       }
@@ -503,7 +618,7 @@ export function G6Console() {
         <div>
           <p className="eyebrow">LOCAL WEBHID · CRC-GUARDED CONFIG</p>
           <h2>把性能调准，<br /><em>也让固件自愈。</em></h2>
-          <p className="lede">DIY 固件开放 40K DPI、8K 回报率、20K 传感器 profile 与主按键映射；原厂固件保留只读诊断和已验证的 1K 安全写入。</p>
+          <p className="lede">原厂固件按官方 8K 协议开放 30K DPI、8K 回报率、20K FPS 与主按键映射；DIY 恢复固件另提供看门狗和传感器隔离。</p>
         </div>
         <div className="device-plate">
           <div className="mouse-wire" />
@@ -514,7 +629,7 @@ export function G6Console() {
 
       <section className="telemetry">
         <article><small>FIRMWARE</small><strong>{firmware}</strong><span>{mode === "diy" ? "自研恢复版" : "本机读取"}</span></article>
-        <article><small>ACTIVE DPI</small><strong>{activeValue || "—"}</strong><span>最高 40,000</span></article>
+        <article><small>ACTIVE DPI</small><strong>{activeValue || "—"}</strong><span>{mode === "legacy" ? "原厂上限 30,000" : "DIY 上限 40,000"}</span></article>
         <article><small>POLLING</small><strong>{polling}<b> Hz</b></strong><span>最高 8,000</span></article>
         <article><small>SENSOR</small><strong>{health ? (health.sensor ? "READY" : "RECOVER") : battery === null ? "—" : `${battery}%`}</strong><span>{health ? `USB ERR ${health.usbErrors}` : "原厂状态"}</span></article>
       </section>
@@ -546,22 +661,22 @@ export function G6Console() {
         </section>
 
         <section className="panel">
-          <div className="panel-head"><div><small>02 / REPORT RATE</small><h3>回报率</h3></div><button className="ghost" onClick={applyPolling} disabled={!online || busy || (mode === "legacy" && polling > 1000)}>写入</button></div>
+          <div className="panel-head"><div><small>02 / REPORT RATE</small><h3>回报率</h3></div><button className="ghost" onClick={applyPolling} disabled={!online || busy}>写入</button></div>
           <div className="rate-list">
             {POLLING.map((value) => {
-              const locked = mode !== "diy" && value > 1000;
-              return <button key={value} className={polling === value ? "rate active" : "rate"} onClick={() => setPolling(value)} disabled={locked}><span>{value >= 1000 ? `${value / 1000}K` : value}</span><small>{locked ? "DIY 固件" : "可写"}</small></button>;
+              const locked = mode === "none";
+              return <button key={value} className={polling === value ? "rate active" : "rate"} onClick={() => setPolling(value)} disabled={locked}><span>{value >= 1000 ? `${value / 1000}K` : value}</span><small>{locked ? "待连接" : "可写"}</small></button>;
             })}
           </div>
-          <div className="warning"><b>{mode === "diy" ? "高速 USB" : "协议边界"}</b><span>{mode === "diy" ? "写入后 USB 自动重枚举，页面会按新端点周期重连。" : "原厂 D086 只开放 125 / 500 / 1000 Hz。"}</span></div>
+          <div className="warning"><b>{mode === "diy" ? "高速 USB" : "原厂 8K"}</b><span>{mode === "diy" ? "写入后 USB 自动重枚举，页面会按新端点周期重连。" : "使用 B5 短命令设置 125 Hz–8K，并在写入后立即回读。"}</span></div>
         </section>
 
         <section className="panel">
-          <div className="panel-head"><div><small>03 / SENSOR FPS</small><h3>20K FPS</h3></div><span className={`chip ${mode === "diy" && fps20k ? "good" : "warn"}`}>{mode === "diy" ? (fps20k ? "ACTIVE" : "READY") : "DIY ONLY"}</span></div>
-          <button className={fps20k ? "toggle on" : "toggle"} onClick={applyFps20k} disabled={!online || busy || mode !== "diy"}>
-            <span><b>0x6E 高性能 profile</b><small>量产表逐字节复现</small></span><i />
+          <div className="panel-head"><div><small>03 / SENSOR FPS</small><h3>20K FPS</h3></div><span className={`chip ${fps20k ? "good" : "warn"}`}>{fps20k ? "ACTIVE" : online ? "READY" : "WAIT"}</span></div>
+          <button className={fps20k ? "toggle on" : "toggle"} onClick={applyFps20k} disabled={!online || busy}>
+            <span><b>{mode === "legacy" ? "原厂 Max Speed Mode" : "0x6E 高性能 profile"}</b><small>{mode === "legacy" ? "命令 0x42 / FPS20K" : "量产表逐字节复现"}</small></span><i />
           </button>
-          <p className="hint">DIY 固件只开放已验证的 20K 档；不会把未确认的中间帧率写进传感器。</p>
+          <p className="hint">原厂路径按 Launcher 的 8K 协议写入并回读；DIY 路径只开放已验证的 20K 档。</p>
         </section>
 
         <section className="panel span2">
@@ -580,12 +695,22 @@ export function G6Console() {
 
         <section className="panel recovery">
           <div className="panel-head"><div><small>05 / RECOVERY</small><h3>死机恢复</h3></div><span className={`chip ${stateTone}`}>{stateLabel}</span></div>
-          <ol>
-            <li><b>SPI 连续失败隔离</b><span>按键/USB 保持工作，不被传感器拖死。</span></li>
-            <li><b>传感器自动重启</b><span>失败 8 次后每秒重试完整启动。</span></li>
-            <li><b>独立看门狗</b><span>主循环卡住超过 1.5 秒自动复位。</span></li>
-          </ol>
-          <button className="recover-button" onClick={reconnect} disabled={busy || !hasDevice}>重开配置通道</button>
+          {mode === "legacy" ? (
+            <ol>
+              <li><b>恢复全部配置</b><span>使用固件已实现的 B5 / 0x0F / 0xFF。</span></li>
+              <li><b>立即回读</b><span>只在 ACK 成功后重新读取 DPI、回报率和 HE 状态。</span></li>
+              <li><b>边界说明</b><span>会清除鼠标内部设置；不能修复已停滞的输入线程。</span></li>
+            </ol>
+          ) : (
+            <ol>
+              <li><b>SPI 连续失败隔离</b><span>按键/USB 保持工作，不被传感器拖死。</span></li>
+              <li><b>传感器自动重启</b><span>失败 8 次后每秒重试完整启动。</span></li>
+              <li><b>独立看门狗</b><span>主循环卡住超过 1.5 秒自动复位。</span></li>
+            </ol>
+          )}
+          <button className="recover-button" onClick={recoverConfiguration} disabled={busy || !hasDevice}>
+            {mode === "legacy" ? "清空并恢复原厂配置" : "重开配置通道"}
+          </button>
         </section>
 
         <section className="panel console-panel">

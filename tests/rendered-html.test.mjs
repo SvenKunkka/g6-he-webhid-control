@@ -48,5 +48,9 @@ test("keeps HID writes target-scoped and guarded", async () => {
   assert.match(source, /USB 正在按新端点周期重新枚举/);
   assert.match(source, /await wait\(1000\)/);
   assert.match(source, /sendFeatureReport/);
-  assert.doesNotMatch(source, /sendReport\(/);
+  assert.match(source, /sendReport/);
+  assert.match(source, /ORIGINAL_LONG_OUT = 0xb3/);
+  assert.match(source, /ORIGINAL_LONG_IN = 0xb4/);
+  assert.match(source, /ORIGINAL_SHORT_OUT = 0xb5/);
+  assert.match(source, /ORIGINAL_SHORT_IN = 0xb6/);
 });
