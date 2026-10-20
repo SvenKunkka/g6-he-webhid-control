@@ -1,3 +1,7 @@
+<!-- SVENKUNKKA-README-NAV:BEGIN -->
+[中文项目说明](#project-overview-zh) · [English overview](#project-overview-en) · [维护者 X / Maintainer on X](https://x.com/Svenu1s5)
+<!-- SVENKUNKKA-README-NAV:END -->
+
 # vinext-starter
 
 A clean full-stack starter running on
@@ -96,3 +100,30 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 
 - [vinext Documentation](https://github.com/cloudflare/vinext)
 - [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+
+
+---
+
+<!-- SVENKUNKKA-PROJECT-INFO:BEGIN -->
+
+<a id="project-overview-zh"></a>
+## 中文项目说明
+
+G6 HE 的浏览器 WebHID 配置控制台，基于 React 与 vinext。源码包含原厂与 DIY 两种协议分支，提供设备连接、DPI、回报率、按键映射、状态读取和配置恢复操作。
+
+**使用入口：** 使用 Node.js 22.13.0 及以上，运行 `npm install`、`npm run dev`。从支持 WebHID 的浏览器打开页面，明确选择匹配设备；主要实现位于 [G6Console.tsx](app/components/G6Console.tsx)。
+
+**范围说明：** 页面包含真实设备写入及恢复配置命令，不能当作纯演示使用。源码中的可选参数和成功日志不等于已完成实机性能验收；原 README 的 vinext-starter 部分仅为基础框架说明。
+
+<a id="project-overview-en"></a>
+## English project overview
+
+A browser-based WebHID configuration console for G6 HE, built with React and vinext. The code includes vendor and DIY protocol branches for connection, DPI, polling rate, button mapping, status reads and configuration recovery.
+
+**Getting started:** Use Node.js 22.13.0 or later, run `npm install` and `npm run dev`, then open the page in a WebHID-capable browser and explicitly select a matching device. The main implementation is [G6Console.tsx](app/components/G6Console.tsx).
+
+**Scope:** The page includes real device-write and configuration-reset commands, so it is not merely a demo. Available settings and success messages in source code do not establish hardware performance validation. The original vinext-starter README section describes the base framework only.
+
+**仓库维护者 / Repository maintainer:** [SvenKunkka](https://github.com/SvenKunkka) · [X / Twitter](https://x.com/Svenu1s5)
+
+<!-- SVENKUNKKA-PROJECT-INFO:END -->
